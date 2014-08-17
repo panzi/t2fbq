@@ -240,13 +240,31 @@ if HAS_LLFUSE:
 	import stat
 	import mmap
 
+	class Archive(object):
+		__slots__ = 'file', 'stat', 'data'
+
+		def __init__(self,file):
+			self.file = file
+			self.stat = os.fstat(file.fileno())
+			self.data = None
+
+		def mmap(self):
+			self.file.seek(0, 0)
+			self.data = mmap.mmap(self.file.fileno(), 0, access=mmap.ACCESS_READ)
+
+		def close(self):
+			if self.data:
+				self.data.close()
+				self.data = None
+			self.file.close()
+
 	class Entry(object):
 		__slots__ = 'inode','_parent','stat','__weakref__'
 
 		def __init__(self,inode,parent=None):
-			self.inode  = inode
-			self.parent = parent
-			self.stat   = None
+			self.inode   = inode
+			self.parent  = parent
+			self.stat    = None
 
 		@property
 		def parent(self):
@@ -272,12 +290,13 @@ if HAS_LLFUSE:
 			return 'Dir(%r, %r)' % (self.inode, self.children)
 
 	class File(Entry):
-		__slots__ = 'offset', 'size'
+		__slots__ = 'archive', 'offset', 'size'
 
-		def __init__(self,inode,offset,size,parent=None):
+		def __init__(self,archive,inode,offset,size,parent=None):
 			Entry.__init__(self,inode,parent)
-			self.offset = offset
-			self.size   = size
+			self.archive = archive
+			self.offset  = offset
+			self.size    = size
 
 		def __repr__(self):
 			return 'File(%r, %r, %r)' % (self.inode, self.offset, self.size)
@@ -286,49 +305,53 @@ if HAS_LLFUSE:
 	DIR_PARENT = '..'.encode(sys.getfilesystemencoding())
 
 	class Operations(llfuse.Operations):
-		__slots__ = 'archive','root','inodes','arch_st','data'
+		__slots__ = 'archives','root','inodes'
 
-		def __init__(self, archive):
+		def __init__(self, archives):
 			llfuse.Operations.__init__(self)
-			self.archive = archive
-			self.arch_st = os.fstat(archive.fileno())
-			self.root    = Dir(llfuse.ROOT_INODE)
-			self.inodes  = {self.root.inode: self.root}
+			self.archives = [Archive(archive) for archive in archives]
+			self.root     = Dir(llfuse.ROOT_INODE)
+			self.inodes   = {self.root.inode: self.root}
 			self.root.parent = self.root
 
 			encoding = sys.getfilesystemencoding()
 			inode = self.root.inode + 1
-			for filename, offset, size in read_index(archive):
-				path = filename.split(os.path.sep)
-				path, name = path[:-1], path[-1]
-				enc_name = name.encode(encoding)
-				name, ext = os.path.splitext(name)
+			for archive in self.archives:
+				for filename, offset, size in read_index(archive.file):
+					path = filename.split(os.path.sep)
+					path, name = path[:-1], path[-1]
+					enc_name = name.encode(encoding)
+					name, ext = os.path.splitext(name)
 
-				parent = self.root
-				for i, comp in enumerate(path):
-					comp = comp.encode(encoding)
-					try:
-						entry = parent.children[comp]
-					except KeyError:
-						entry = parent.children[comp] = self.inodes[inode] = Dir(inode, parent=parent)
-						inode += 1
+					parent = self.root
+					for i, comp in enumerate(path):
+						comp = comp.encode(encoding)
+						try:
+							entry = parent.children[comp]
+						except KeyError:
+							entry = parent.children[comp] = self.inodes[inode] = Dir(inode, parent=parent)
+							inode += 1
 						
-					if type(entry) is not Dir:
-						raise ValueError("name conflict in archive: %r is not a directory" % os.path.join(*path[:i+1]))
+						if type(entry) is not Dir:
+							raise ValueError("name conflict in archive: %r is not a directory" % os.path.join(*path[:i+1]))
 
-					parent = entry
+						parent = entry
 
-				i = 0
-				while enc_name in parent.children:
-					sys.stderr.write("Warning: doubled name in archive: %s\n" % filename)
-					i += 1
-					enc_name = ("%s~%d%s" % (name, i, ext)).encode(encoding)
+					oldentry = parent.children.get(enc_name,None)
+					if oldentry:
+						if oldentry.archive is archive:
+							i = 0
+							while enc_name in parent.children:
+								sys.stderr.write("Warning: doubled name in archive: %s\n" % filename)
+								i += 1
+								enc_name = ("%s~%d%s" % (name, i, ext)).encode(encoding)
+						else:
+							del self.inodes[oldentry.inode]
 
-				parent.children[enc_name] = self.inodes[inode] = File(inode, offset, size, parent)
-				inode += 1
+					parent.children[enc_name] = self.inodes[inode] = File(archive, inode, offset, size, parent)
+					inode += 1
 
-			archive.seek(0, 0)
-			self.data = mmap.mmap(archive.fileno(), 0, access=mmap.ACCESS_READ)
+				archive.mmap()
 
 			# cache entry attributes
 			for inode in self.inodes:
@@ -336,8 +359,8 @@ if HAS_LLFUSE:
 				entry.stat = self._getattr(entry)
 
 		def destroy(self):
-			self.data.close()
-			self.archive.close()
+			for archive in self.archives:
+				archive.close()
 
 		def lookup(self, parent_inode, name):
 			try:
@@ -376,19 +399,29 @@ if HAS_LLFUSE:
 				attrs.st_mode  = stat.S_IFDIR | 0o555
 				attrs.st_nlink = nlink
 				attrs.st_size  = size
+
+				attrs.st_uid     = os.getuid()
+				attrs.st_gid     = os.getgid()
+				attrs.st_blksize = 4096
+				attrs.st_blocks  = 0
+				# TODO: better times?
+				attrs.st_atime   = 0
+				attrs.st_mtime   = 0
+				attrs.st_ctime   = 0
+
 			else:
 				attrs.st_nlink = 1
 				attrs.st_mode  = stat.S_IFREG | 0o444
 				attrs.st_size  = entry.size
 
-			arch_st = self.arch_st
-			attrs.st_uid     = arch_st.st_uid
-			attrs.st_gid     = arch_st.st_gid
-			attrs.st_blksize = arch_st.st_blksize
-			attrs.st_blocks  = 1 + ((attrs.st_size - 1) // attrs.st_blksize) if attrs.st_size != 0 else 0
-			attrs.st_atime   = arch_st.st_atime
-			attrs.st_mtime   = arch_st.st_mtime
-			attrs.st_ctime   = arch_st.st_ctime
+				arch_st = entry.archive.stat
+				attrs.st_uid     = arch_st.st_uid
+				attrs.st_gid     = arch_st.st_gid
+				attrs.st_blksize = arch_st.st_blksize
+				attrs.st_blocks  = 1 + ((attrs.st_size - 1) // attrs.st_blksize) if attrs.st_size != 0 else 0
+				attrs.st_atime   = arch_st.st_atime
+				attrs.st_mtime   = arch_st.st_mtime
+				attrs.st_ctime   = arch_st.st_ctime
 
 			return attrs
 
@@ -440,10 +473,9 @@ if HAS_LLFUSE:
 		def statfs(self):
 			attrs = llfuse.StatvfsData()
 
-			arch_st = self.arch_st
-			attrs.f_bsize  = arch_st.st_blksize
-			attrs.f_frsize = arch_st.st_blksize
-			attrs.f_blocks = arch_st.st_blocks
+			attrs.f_bsize  = 4096
+			attrs.f_frsize = 4096
+			attrs.f_blocks = sum(archive.stat.st_blocks for archive in self.archives)
 			attrs.f_bfree  = 0
 			attrs.f_bavail = 0
 
@@ -478,7 +510,7 @@ if HAS_LLFUSE:
 
 			i = entry.offset + offset
 			j = i + min(entry.size - offset, length)
-			return self.data[i:j]
+			return entry.archive.data[i:j]
 
 		def release(self, fh):
 			pass
@@ -528,12 +560,38 @@ if HAS_LLFUSE:
 		os.dup2(so.fileno(), sys.stdout.fileno())
 		os.dup2(se.fileno(), sys.stderr.fileno())
 
-	def mount(archive,mountpt,foreground=False,debug=False):
-		archive = os.path.abspath(archive)
+	def open_multi(paths,mode="rb"):
+		files = []
+		exc = None
+		for path in paths:
+			try:
+				files.append(open(path,mode))
+			except Exception as e:
+				exc = e
+				break
+
+		if exc is None:
+			return files
+
+		close_multi(files)
+
+		raise exc
+	
+	def close_multi(files):
+		for fp in files:
+			try:
+				fp.close()
+			except Exception as e:
+				sys.stderr.write("%s\n" % e)
+
+	def mount(archives,mountpt,foreground=False,debug=False):
+		archives = [os.path.abspath(archive) for archive in archives]
 		mountpt = os.path.abspath(mountpt)
-		with open(archive,"rb") as fp:
-			ops = Operations(fp)
-			args = ['fsname=u4pak', 'subtype=u4pak', 'ro']
+		files = open_multi(archives)
+
+		try:
+			ops = Operations(files)
+			args = ['fsname=t2fbq', 'subtype=t2fbq', 'ro']
 
 			if debug:
 				foreground = True
@@ -547,6 +605,9 @@ if HAS_LLFUSE:
 				llfuse.main(single=False)
 			finally:
 				llfuse.close()
+
+		finally:
+			close_multi(files)
 
 def main(argv):
 	import argparse
@@ -613,7 +674,7 @@ def main(argv):
 		help='print debug output (implies -f)')
 	mount_parser.add_argument('-f','--foreground',action='store_true',default=False,
 		help='foreground operation')
-	mount_parser.add_argument('archive', help='Trine 2 .fbq archive')
+	mount_parser.add_argument('archives', nargs='+', help='Trine 2 .fbq archive')
 	mount_parser.add_argument('mountpt', help='mount point')
 
 	args = parser.parse_args(argv)
@@ -640,7 +701,7 @@ def main(argv):
 		if not HAS_LLFUSE:
 			raise ValueError('the llfuse python module is needed for this feature')
 
-		mount(args.archive,args.mountpt,args.foreground,args.debug)
+		mount(args.archives,args.mountpt,args.foreground,args.debug)
 
 	else:
 		raise ValueError('unknown command: %s' % args.command)
