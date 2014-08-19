@@ -30,6 +30,13 @@ from collections import OrderedDict
 from io import BytesIO
 
 try:
+	from lzf import decompress
+except ImportError:
+	HAS_LZF = False
+else:
+	HAS_LZF = True
+
+try:
 	import llfuse
 except ImportError:
 	HAS_LLFUSE = False
@@ -91,20 +98,27 @@ def read_index(stream):
 			namebuf.write(byte)
 		name = namebuf.getvalue().decode('ascii').replace('/',os.path.sep)
 		buf = stream.read(17)
-		offset, unknown1, size, unknown2 = struct.unpack('<I5sII',buf)
+		offset, nocompr, uncompressed_size, compressed_size, chksum = struct.unpack('<IBIII',buf)
+		compr = nocompr == 0
+		if not compr:
+			if compressed_size != uncompressed_size:
+				raise ValueError("not compressed but compressed size (%u) != uncompressed size (%u)" %
+					(compressed_size, uncompressed_size))
+			compressed_size = None
 
 		pos = stream.tell()
 		if pos > data_offset:
 			raise ValueError("index bleeds into data section. pos = %u, data_offset = %u, i = %u, entry_count = %u" %
 				(pos, data_offset, i, entry_count))
 
-		yield name, data_offset + offset, size
+		yield name, data_offset + offset, uncompressed_size, compressed_size, chksum
 		stream.seek(pos, 0)
 		i += 1
 
 def unpack(stream,outdir=".",callback=lambda name: None):
-	for name, offset, size in read_index(stream):
-		unpack_file(stream,name,offset,size,outdir,callback)
+	# convert to list to reduce seeking in file and completely parse index before writing any files
+	for name, offset, size, csize, chksum in list(read_index(stream)):
+		unpack_file(stream,name,offset,size,csize,outdir,callback)
 
 def shall_unpack(paths,name):
 	path = name.split(os.path.sep)
@@ -115,19 +129,33 @@ def shall_unpack(paths,name):
 	return False
 
 def unpack_files(stream,files,outdir=".",callback=lambda name: None):
-	for name, offset, size in read_index(stream):
+	# convert to list to reduce seeking in file and completely parse index before writing any files
+	for name, offset, size, csize, chksum in list(read_index(stream)):
 		if shall_unpack(files,name):
-			unpack_file(stream,name,offset,size,outdir,callback)
+			unpack_file(stream,name,offset,size,csize,outdir,callback)
 
-def unpack_file(stream,name,offset,size,outdir=".",callback=lambda name: None):
+def unpack_file(stream,name,offset,size,csize,outdir=".",callback=lambda name: None):
 	prefix, name = os.path.split(name)
 	prefix = os.path.join(outdir,prefix)
 	if not os.path.exists(prefix):
 		os.makedirs(prefix)
 	name = os.path.join(prefix,name)
 	callback(name)
-	with open(name,"wb") as fp:
-		sendfile(fp,stream,offset,size)
+	if csize is None:
+		with open(name,"wb") as fp:
+			sendfile(fp,stream,offset,size)
+	else:
+		stream.seek(offset, 0)
+		cdata = stream.read(csize)
+		if len(cdata) != csize:
+			raise IOError("unexpected end of file while reading data of entry: %s" % name)
+
+		data = decompress(cdata,size)
+		if data is None or len(data) != size:
+			raise IOError("error uncompressing entry: %s" % name)
+
+		with open(name,"wb") as fp:
+			fp.write(data)
 
 def human_size(size):
 	if size < 2 ** 10:
@@ -184,28 +212,43 @@ def print_list(stream,details=False,human=False,delim="\n",sort_func=None,out=sy
 
 		count = 0
 		sum_size = 0
-		out.write("    Offset       Size Name%s" % delim)
-		for name, offset, size in index:
-			out.write("%10u %10s %s%s" % (offset, size_to_str(size), name, delim))
+		out.write("    Offset         Size  Compr. Size  Compr.  Checksum  Name%s" % delim)
+		for name, offset, size, csize, chksum in index:
+			if csize is None:
+				out.write("%10u  %11s            -          %08x  %s%s" % (
+					offset, size_to_str(size), chksum, name, delim))
+			else:
+				out.write("%10u  %11s  %11s  LZF     %08x  %s%s" % (
+					offset, size_to_str(size), size_to_str(csize), chksum, name, delim))
 			count += 1
 			sum_size += size
 		out.write("%d file(s) (%s) %s" % (count, size_to_str(sum_size), delim))
 	else:
-		for name, offset, size in index:
-			out.write("%s%s" % (name, delim))
+		for item in index:
+			out.write("%s%s" % (item[0], delim))
 
 SORT_ALIASES = {
 	"s": "size",
 	"S": "-size",
+	"c": "csize",
+	"C": "-csize",
 	"o": "offset",
 	"O": "-offset",
 	"n": "name",
 	"N": "-name"
 }
 
+# for Python 3
+if not hasattr(__builtins__,'cmp'):
+	def cmp(a, b):
+		return (a > b) - (a < b)
+
 CMP_FUNCS = {
 	"size":  lambda lhs, rhs: cmp(lhs[2], rhs[2]),
 	"-size": lambda lhs, rhs: cmp(rhs[2], lhs[2]),
+	
+	"csize":  lambda lhs, rhs: cmp(lhs[3] or 0, rhs[3] or 0),
+	"-csize": lambda lhs, rhs: cmp(rhs[3] or 0, lhs[3] or 0),
 
 	"offset":  lambda lhs, rhs: cmp(lhs[1], rhs[1]),
 	"-offset": lambda lhs, rhs: cmp(rhs[1], lhs[1]),
@@ -257,6 +300,9 @@ if HAS_LLFUSE:
 				self.data.close()
 				self.data = None
 			self.file.close()
+			
+		def __repr__(self):
+			return 'Archive(file=%r)' % self.file
 
 	class Entry(object):
 		__slots__ = 'inode','_parent','stat','__weakref__'
@@ -287,19 +333,56 @@ if HAS_LLFUSE:
 					child.parent = self
 
 		def __repr__(self):
-			return 'Dir(%r, %r)' % (self.inode, self.children)
+			return 'Dir(indoe=%r, children=%r)' % (self.inode, self.children)
 
 	class File(Entry):
-		__slots__ = 'archive', 'offset', 'size'
+		__slots__ = 'archive', 'offset', 'size', 'csize', 'chksum', 'opencount', 'cache'
 
-		def __init__(self,archive,inode,offset,size,parent=None):
+		def __init__(self,archive,inode,offset,size,csize,chksum,parent=None):
 			Entry.__init__(self,inode,parent)
-			self.archive = archive
-			self.offset  = offset
-			self.size    = size
+			self.archive   = archive
+			self.offset    = offset
+			self.size      = size
+			self.csize     = csize
+			self.chksum     = chksum
+			self.opencount = 0
+			self.cache     = None
+
+		def open(self):
+			self.opencount += 1
+
+		def close(self):
+			count = self.opencount - 1
+			if count <= 0:
+				self.opencount = 0
+				self.cache     = None
+			else:
+				self.opencount = count
+		
+		def read(self,offset,length):
+			if offset > self.size:
+				return bytes()
+
+			if self.csize is None:
+				i = self.offset + offset
+				j = i + min(self.size - offset, length)
+				return self.archive.data[i:j]
+
+			if self.cache is None:
+				self.cache = decompress(self.archive.data[self.offset:self.offset+self.csize], self.size)
+				if self.cache is None or len(self.cache) != self.size:
+					self.cache = None
+					raise llfuse.FUSEError(errno.EIO)
+
+			return self.cache[offset:offset+length]
+
+		@property
+		def compressed(self):
+			return self.csize is not None
 
 		def __repr__(self):
-			return 'File(%r, %r, %r)' % (self.inode, self.offset, self.size)
+			return 'File(archive=%r, inode=%r, offset=%r, size=%r, csize=%r, chksum=0x%08x)' % (
+				self.archive, self.inode, self.offset, self.size, self.csize, self.chksum)
 
 	DIR_SELF   = '.'.encode(sys.getfilesystemencoding())
 	DIR_PARENT = '..'.encode(sys.getfilesystemencoding())
@@ -317,7 +400,7 @@ if HAS_LLFUSE:
 			encoding = sys.getfilesystemencoding()
 			inode = self.root.inode + 1
 			for archive in self.archives:
-				for filename, offset, size in read_index(archive.file):
+				for filename, offset, size, csize, chksum in read_index(archive.file):
 					path = filename.split(os.path.sep)
 					path, name = path[:-1], path[-1]
 					enc_name = name.encode(encoding)
@@ -348,7 +431,8 @@ if HAS_LLFUSE:
 						else:
 							del self.inodes[oldentry.inode]
 
-					parent.children[enc_name] = self.inodes[inode] = File(archive, inode, offset, size, parent)
+					parent.children[enc_name] = self.inodes[inode] = File(archive, inode, offset, size,
+					                                                      csize, chksum, parent)
 					inode += 1
 
 				archive.mmap()
@@ -412,7 +496,7 @@ if HAS_LLFUSE:
 			else:
 				attrs.st_nlink = 1
 				attrs.st_mode  = stat.S_IFREG | 0o444
-				attrs.st_size  = entry.size
+				attrs.st_size  = entry.csize if entry.csize is not None else entry.size
 
 				arch_st = entry.archive.stat
 				attrs.st_uid     = arch_st.st_uid
@@ -497,6 +581,7 @@ if HAS_LLFUSE:
 				if flags & 3 != os.O_RDONLY:
 					raise llfuse.FUSEError(errno.EACCES)
 
+				entry.open()
 				return inode
 
 		def read(self, fh, offset, length):
@@ -504,16 +589,16 @@ if HAS_LLFUSE:
 				entry = self.inodes[fh]
 			except KeyError:
 				raise llfuse.FUSEError(errno.ENOENT)
-
-			if offset > entry.size:
-				return bytes()
-
-			i = entry.offset + offset
-			j = i + min(entry.size - offset, length)
-			return entry.archive.data[i:j]
+			else:
+				return entry.read(offset, length)
 
 		def release(self, fh):
-			pass
+			try:
+				entry = self.inodes[fh]
+			except KeyError:
+				pass
+			else:
+				entry.close()
 
 	# based on http://code.activestate.com/recipes/66012/
 	def deamonize(stdout='/dev/null', stderr=None, stdin='/dev/null'):
@@ -576,7 +661,7 @@ if HAS_LLFUSE:
 		close_multi(files)
 
 		raise exc
-	
+
 	def close_multi(files):
 		for fp in files:
 			try:
@@ -691,6 +776,9 @@ def main(argv):
 			print_list(stream,args.details,args.human,delim,args.sort_func)
 	
 	elif args.command == 'unpack':
+		if not HAS_LZF:
+			raise ValueError("the lzf python module is needed for this feature")
+
 		with open(args.archive,"rb") as stream:
 			if args.files:
 				unpack_files(stream,set(name.strip(os.path.sep) for name in args.files),args.dir,callback)
@@ -698,6 +786,9 @@ def main(argv):
 				unpack(stream,args.dir,callback)
 
 	elif args.command == 'mount':
+		if not HAS_LZF:
+			raise ValueError("the lzf python module is needed for this feature")
+
 		if not HAS_LLFUSE:
 			raise ValueError('the llfuse python module is needed for this feature')
 
@@ -718,3 +809,4 @@ if __name__ == '__main__':
 		main(sys.argv[1:])
 	except Exception as exc:
 		sys.stderr.write("%s\n" % exc)
+		sys.exit(1)

@@ -10,7 +10,9 @@ Basic usage:
 	t2fbq.py mount <archive> [archive]... <mount-point>  - mount archive as read-only file system
 
 The `mount` command depends on the [llfuse](https://code.google.com/p/python-llfuse/)
-Python package. If it's not available the rest is still working.
+Python package and the `unpack` and `mount` commands depend on the
+[lzf](https://github.com/teepark/python-lzf) Python package. If these packages are not
+available the rest is still working.
 
 This script is compatible with Python 2.7 and 3 (tested with 2.7.5 and 3.3.2).
 
@@ -20,6 +22,8 @@ File Format
 Byte order is little endian and the character encoding of file names seems to
 be ASCII (or ISO-8859-1/UTF-8 that coincidentally only uses ASCII compatiple
 characters).
+
+Data might be compressed using the LZF compression algorithm.
 
 Basic layout:
 
@@ -37,11 +41,12 @@ Basic layout:
 ### Index Record
 
 	Offset  Size  Type      Description
-         0     N  char[N]   null terminated absolute file name ('/' is path separator)
-         N     4  uint32_t  data offset relative to end of index
-	   N+4     5  ?         ?
-	   N+9     4  uint32_t  data size
-	  N+13     4  ?         ?
+	     0     N  char[N]   null terminated absolute file name ('/' is path separator)
+	     N     4  uint32_t  data offset relative to end of index
+	   N+4     1  bool      not compressed flag (1 if data is not compressed, 0 if compressed)
+	   N+5     4  uint32_t  uncompressed size
+	   N+9     4  uint32_t  compressed size
+	  N+13     4  uint32_t  chceksum of unknown algorithm?
 
 Related Projects
 ----------------
