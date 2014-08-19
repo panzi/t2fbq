@@ -23,7 +23,9 @@ Byte order is little endian and the character encoding of file names seems to
 be ASCII (or ISO-8859-1/UTF-8 that coincidentally only uses ASCII compatiple
 characters).
 
-Data might be compressed using the LZF compression algorithm.
+Data might be compressed using the LZF compression algorithm. I got the information
+about the compression algorithm and uncompressed size Vs. compressed size fields from
+[QuickBMS](http://aluigi.altervista.org/quickbms.htm): http://aluigi.altervista.org/papers/bms/trine2.bms
 
 Basic layout:
 
