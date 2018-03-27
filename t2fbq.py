@@ -43,6 +43,8 @@ except ImportError:
 else:
 	HAS_LLFUSE = True
 
+HAS_STAT_NS = hasattr(os.stat_result, 'st_atime_ns')
+
 __all__ = 'read_index', 'unpack', 'unpack_files', 'print_list', 'mount'
 
 # for Python < 3.3 and Windows
@@ -446,7 +448,7 @@ if HAS_LLFUSE:
 			for archive in self.archives:
 				archive.close()
 
-		def lookup(self, parent_inode, name):
+		def lookup(self, parent_inode, name, ctx):
 			try:
 				if name == DIR_SELF:
 					entry = self.inodes[parent_inode]
@@ -484,32 +486,28 @@ if HAS_LLFUSE:
 				attrs.st_nlink = nlink
 				attrs.st_size  = size
 
-				attrs.st_uid     = os.getuid()
-				attrs.st_gid     = os.getgid()
-				attrs.st_blksize = 4096
-				attrs.st_blocks  = 0
-				# TODO: better times?
-				attrs.st_atime   = 0
-				attrs.st_mtime   = 0
-				attrs.st_ctime   = 0
-
 			else:
 				attrs.st_nlink = 1
 				attrs.st_mode  = stat.S_IFREG | 0o444
 				attrs.st_size  = entry.csize if entry.csize is not None else entry.size
 
-				arch_st = entry.archive.stat
-				attrs.st_uid     = arch_st.st_uid
-				attrs.st_gid     = arch_st.st_gid
-				attrs.st_blksize = arch_st.st_blksize
-				attrs.st_blocks  = 1 + ((attrs.st_size - 1) // attrs.st_blksize) if attrs.st_size != 0 else 0
-				attrs.st_atime   = arch_st.st_atime
-				attrs.st_mtime   = arch_st.st_mtime
-				attrs.st_ctime   = arch_st.st_ctime
+			arch_st = entry.archive.stat
+			attrs.st_uid     = arch_st.st_uid
+			attrs.st_gid     = arch_st.st_gid
+			attrs.st_blksize = arch_st.st_blksize
+			attrs.st_blocks  = 1 + ((attrs.st_size - 1) // attrs.st_blksize) if attrs.st_size != 0 else 0
+			if HAS_STAT_NS:
+				attrs.st_atime_ns = arch_st.st_atime_ns
+				attrs.st_mtime_ns = arch_st.st_mtime_ns
+				attrs.st_ctime_ns = arch_st.st_ctime_ns
+			else:
+				attrs.st_atime_ns = int(arch_st.st_atime * 1000)
+				attrs.st_mtime_ns = int(arch_st.st_mtime * 1000)
+				attrs.st_ctime_ns = int(arch_st.st_ctime * 1000)
 
 			return attrs
 
-		def getattr(self, inode):
+		def getattr(self, inode, ctx):
 			try:
 				entry = self.inodes[inode]
 			except KeyError:
@@ -526,7 +524,7 @@ if HAS_LLFUSE:
 				st_mode = 0o555 if type(entry) is Dir else 0o444
 				return (st_mode & mode) == mode
 
-		def opendir(self, inode):
+		def opendir(self, inode, ctx):
 			try:
 				entry = self.inodes[inode]
 			except KeyError:
@@ -554,7 +552,7 @@ if HAS_LLFUSE:
 		def releasedir(self, fh):
 			pass
 
-		def statfs(self):
+		def statfs(self, ctx):
 			attrs = llfuse.StatvfsData()
 
 			attrs.f_bsize  = 4096
@@ -569,7 +567,7 @@ if HAS_LLFUSE:
 
 			return attrs
 
-		def open(self, inode, flags):
+		def open(self, inode, flags, ctx):
 			try:
 				entry = self.inodes[inode]
 			except KeyError:
@@ -687,7 +685,7 @@ if HAS_LLFUSE:
 
 			llfuse.init(ops, mountpt, args)
 			try:
-				llfuse.main(single=False)
+				llfuse.main()
 			finally:
 				llfuse.close()
 
